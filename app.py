@@ -1,4 +1,3 @@
-
 import math
 import random
 from datetime import datetime
@@ -6,6 +5,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
@@ -87,6 +87,19 @@ FALLBACK_SYMBOLS = [
     "PASO", "QMCO", "RETO", "SLNH", "TENX", "UAVS", "VERB", "WATT", "XSPA", "YTRA",
     "ZKIN", "ATOS", "BKKT", "CEI", "DWAC", "EXPR", "GME", "AMC", "BBBY", "MMAT",
 ]
+
+
+def safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        result = float(value)
+        if math.isnan(result) or math.isinf(result):
+            return default
+        return result
+    except (TypeError, ValueError):
+        return default
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_symbol_universe(exchange_filter):
@@ -189,6 +202,113 @@ def fetch_ticker_info(symbol):
         return {"sector": "Bilinmiyor", "industry": "Bilinmiyor", "longName": symbol, "marketCap": None}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_tradingview_scan(price_min, price_max, min_volume, vol_spike_mult,
+                            rsi_min, rsi_max, sector, exchange_filter, macd_filter, sma_filter):
+    filters = [
+        {"left": "close", "operation": "in_range", "right": [price_min, price_max]},
+        {"left": "volume", "operation": "greater", "right": min_volume},
+        {"left": "relative_volume_10d_calc", "operation": "greater", "right": vol_spike_mult},
+        {"left": "is_primary", "operation": "equal", "right": True},
+        {"left": "type", "operation": "equal", "right": "stock"},
+    ]
+
+    if rsi_max is not None:
+        filters.append({"left": "RSI", "operation": "less", "right": rsi_max})
+    if rsi_min is not None:
+        filters.append({"left": "RSI", "operation": "greater", "right": rsi_min})
+    if sector and sector != "Tümü":
+        filters.append({"left": "sector", "operation": "in_range", "right": [sector]})
+    if exchange_filter == "Sadece NASDAQ":
+        filters.append({"left": "exchange", "operation": "in_range", "right": ["NASDAQ"]})
+    elif exchange_filter == "Sadece NYSE":
+        filters.append({"left": "exchange", "operation": "in_range", "right": ["NYSE", "AMEX"]})
+
+    if macd_filter == "MACD > Sinyal (Pozitif)":
+        filters.append({"left": "MACD.macd", "operation": "greater", "right": ["MACD.signal"]})
+    elif macd_filter == "MACD < Sinyal (Negatif)":
+        filters.append({"left": "MACD.macd", "operation": "less", "right": ["MACD.signal"]})
+
+    payload = {
+        "filter": filters,
+        "options": {"lang": "en"},
+        "symbols": {"query": {"types": []}, "tickers": []},
+        "columns": [
+            "description", "close", "change", "volume",
+            "average_volume_10d_calc", "relative_volume_10d_calc",
+            "RSI", "MACD.macd", "MACD.signal",
+            "SMA20", "SMA50", "SMA200", "sector",
+        ],
+        "sort": {"sortBy": "relative_volume_10d_calc", "sortOrder": "desc"},
+        "range": [0, 300],
+    }
+
+    try:
+        response = requests.post(
+            "https://scanner.tradingview.com/america/scan",
+            json=payload,
+            headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        raw_json = response.json()
+    except Exception as exc:
+        return None, str(exc)
+
+    rows = []
+    for item in raw_json.get("data", []):
+        try:
+            d = item.get("d", [])
+            if len(d) < 12:
+                continue
+
+            symbol = item.get("s", "UNKNOWN:UNKNOWN")
+            exchange_name = symbol.split(":")[0] if ":" in symbol else "UNKNOWN"
+            ticker_symbol = symbol.split(":")[-1] if ":" in symbol else symbol
+
+            close_price = safe_float(d[1])
+            if close_price <= 0:
+                continue
+
+            sma20 = safe_float(d[9], close_price)
+            sma50 = safe_float(d[10], close_price)
+            sma200 = safe_float(d[11], close_price)
+
+            strong_up = close_price > sma20 > sma50 > sma200
+            strong_down = close_price < sma20 < sma50 < sma200
+
+            if sma_filter == "Güçlü Yükseliş (Fiyat>SMA20>SMA50>SMA200)" and not strong_up:
+                continue
+            if sma_filter == "Güçlü Düşüş (Fiyat<SMA20<SMA50<SMA200)" and not strong_down:
+                continue
+
+            trend_label = "Güçlü Yükseliş" if strong_up else ("Güçlü Düşüş" if strong_down else "Nötr")
+
+            rows.append({
+                "Sembol": ticker_symbol,
+                "Şirket": d[0] if d[0] else ticker_symbol,
+                "Sektör": d[12] if d[12] else "Bilinmiyor",
+                "Fiyat": round(close_price, 4),
+                "Değişim%": round(safe_float(d[2]), 2),
+                "Hacim": int(safe_float(d[3])),
+                "Ort.Hacim10": int(safe_float(d[4])),
+                "HacimArtış(x)": round(safe_float(d[5]), 2),
+                "RSI14": round(safe_float(d[6], 50), 2),
+                "MACD": round(safe_float(d[7]), 4),
+                "MACD_Sinyal": round(safe_float(d[8]), 4),
+                "SMA20": round(sma20, 4),
+                "SMA50": round(sma50, 4),
+                "SMA200": round(sma200, 4),
+                "Trend": trend_label,
+                "Exchange": exchange_name,
+            })
+        except Exception:
+            continue
+
+    result_df = pd.DataFrame(rows)
+    return result_df, None
+
+
 def compute_rsi(series, period=14):
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -236,8 +356,8 @@ def add_indicators(df):
     return result
 
 
-def run_scan(universe_df, max_scan, use_random, price_min, price_max, min_volume,
-             vol_spike_mult, period, interval, rsi_filter, macd_filter, sma_filter, sector_filter):
+def run_scan_yfinance(universe_df, max_scan, use_random, price_min, price_max, min_volume,
+                       vol_spike_mult, period, interval, rsi_filter, macd_filter, sma_filter, sector_filter):
     all_symbols = universe_df["Symbol"].tolist()
     if use_random and len(all_symbols) > max_scan:
         symbols = random.sample(all_symbols, max_scan)
@@ -344,7 +464,7 @@ def run_scan(universe_df, max_scan, use_random, price_min, price_max, min_volume
             continue
 
     result_df = pd.DataFrame(results)
-    return result_df, price_data, fetch_errors
+    return result_df, fetch_errors
 
 
 def build_chart(df, symbol):
@@ -460,61 +580,115 @@ def main():
     st.caption("NASDAQ & NYSE — Düşük Fiyatlı, Yüksek Potansiyelli Hisse Tarayıcısı")
 
     with st.sidebar:
+        st.header("⚙️ Veri Kaynağı")
+        data_source = st.selectbox(
+            "Tarama Motoru",
+            ["TradingView (Hızlı Tarama)", "yfinance (Detaylı Tarama)"],
+            help="TradingView: binlerce hisseyi saniyeler içinde tarar. yfinance: daha yavaş ama MACD/SMA kesişim tespiti gibi geçmişe dayalı sinyaller sunar.",
+        )
+
+        st.markdown("---")
         st.header("🔍 Filtreleme Parametreleri")
 
         exchange_filter = st.selectbox("Borsa", ["Tümü", "Sadece NASDAQ", "Sadece NYSE"])
-        max_scan = st.slider("Maksimum Taranacak Hisse Sayısı", 20, 500, 150, step=10)
-        use_random = st.checkbox("Rastgele Örnekleme Kullan", value=False)
+
+        if data_source == "yfinance (Detaylı Tarama)":
+            max_scan = st.slider("Maksimum Taranacak Hisse Sayısı", 20, 500, 150, step=10)
+            use_random = st.checkbox("Rastgele Örnekleme Kullan", value=False)
+        else:
+            max_scan = 300
+            use_random = False
 
         price_min, price_max = st.slider("Fiyat Aralığı ($)", 0.01, 20.0, (0.50, 5.00), step=0.01)
         min_volume = st.number_input("Minimum Günlük Hacim", min_value=0, value=500000, step=50000)
         vol_spike_mult = st.slider("Min. Hacim Artış Katsayısı (Ort. 10 Güne Göre)", 1.0, 10.0, 3.0, step=0.1)
 
+        st.markdown("---")
+        st.subheader("📅 Grafik Zaman Ayarları")
         interval = st.selectbox("Zaman Aralığı", ["1d", "1h"], index=0)
         if interval == "1h":
             period = st.selectbox("Veri Periyodu", ["5d", "1mo"], index=1)
         else:
             period = st.selectbox("Veri Periyodu", ["3mo", "6mo", "1y"], index=1)
 
+        st.markdown("---")
         sector_filter = st.selectbox("Sektör", SECTORS)
         rsi_filter = st.selectbox("RSI Koşulu", ["Tümü", "RSI Aşırı Satım (<30)", "RSI Aşırı Alım (>70)"])
-        macd_filter = st.selectbox("MACD Koşulu", ["Tümü", "Yükseliş Kesişimi (Bullish)", "Düşüş Kesişimi (Bearish)"])
-        sma_filter = st.selectbox(
-            "SMA Trend / Kesişim Koşulu",
-            ["Tümü", "Güçlü Yükseliş (Fiyat>SMA20>SMA50>SMA200)", "Güçlü Düşüş (Fiyat<SMA20<SMA50<SMA200)",
-             "Golden Cross (20/50)", "Death Cross (20/50)"],
-        )
+
+        if data_source == "yfinance (Detaylı Tarama)":
+            macd_filter = st.selectbox("MACD Koşulu", ["Tümü", "Yükseliş Kesişimi (Bullish)", "Düşüş Kesişimi (Bearish)"])
+            sma_filter = st.selectbox(
+                "SMA Trend / Kesişim Koşulu",
+                ["Tümü", "Güçlü Yükseliş (Fiyat>SMA20>SMA50>SMA200)", "Güçlü Düşüş (Fiyat<SMA20<SMA50<SMA200)",
+                 "Golden Cross (20/50)", "Death Cross (20/50)"],
+            )
+        else:
+            macd_filter = st.selectbox("MACD Koşulu", ["Tümü", "MACD > Sinyal (Pozitif)", "MACD < Sinyal (Negatif)"])
+            sma_filter = st.selectbox(
+                "SMA Trend Koşulu",
+                ["Tümü", "Güçlü Yükseliş (Fiyat>SMA20>SMA50>SMA200)", "Güçlü Düşüş (Fiyat<SMA20<SMA50<SMA200)"],
+            )
+            st.caption("ℹ️ Kesişim (cross) tabanlı sinyaller için 'yfinance (Detaylı Tarama)' modunu seçin.")
 
         scan_button = st.button("🚀 Taramayı Başlat / Yenile", use_container_width=True, type="primary")
 
     if "scan_results" not in st.session_state:
         st.session_state.scan_results = None
-        st.session_state.price_data = None
+        st.session_state.price_data = {}
         st.session_state.last_scan_time = None
+        st.session_state.active_source = None
 
     if scan_button or st.session_state.scan_results is None:
         with st.spinner("Piyasa taranıyor, lütfen bekleyin..."):
-            universe_df = load_symbol_universe(exchange_filter)
-            if universe_df is None or universe_df.empty:
-                st.error("Hisse evreni yüklenemedi. Lütfen internet bağlantınızı kontrol edin veya daha sonra tekrar deneyin.")
-                st.stop()
+            if data_source == "TradingView (Hızlı Tarama)":
+                rsi_min_val = 70 if rsi_filter == "RSI Aşırı Alım (>70)" else None
+                rsi_max_val = 30 if rsi_filter == "RSI Aşırı Satım (<30)" else None
 
-            result_df, price_data, fetch_errors = run_scan(
-                universe_df, max_scan, use_random, price_min, price_max, min_volume,
-                vol_spike_mult, period, interval, rsi_filter, macd_filter, sma_filter, sector_filter,
-            )
+                result_df, tv_error = fetch_tradingview_scan(
+                    price_min, price_max, min_volume, vol_spike_mult,
+                    rsi_min_val, rsi_max_val, sector_filter, exchange_filter, macd_filter, sma_filter,
+                )
+
+                if tv_error is not None:
+                    st.warning(
+                        f"TradingView tarama servisine ulaşılamadı ({tv_error}). "
+                        f"Otomatik olarak yfinance tarama motoruna geçiliyor."
+                    )
+                    universe_df = load_symbol_universe(exchange_filter)
+                    result_df, fetch_errors = run_scan_yfinance(
+                        universe_df, 150, False, price_min, price_max, min_volume,
+                        vol_spike_mult, period, interval, rsi_filter,
+                        "Tümü", "Tümü", sector_filter,
+                    )
+                    st.session_state.active_source = "yfinance (Otomatik Yedek)"
+                    if fetch_errors:
+                        st.warning(f"Bazı veri parçaları alınırken sorun oluştu ({len(fetch_errors)} hata).")
+                else:
+                    st.session_state.active_source = "TradingView"
+            else:
+                universe_df = load_symbol_universe(exchange_filter)
+                if universe_df is None or universe_df.empty:
+                    st.error("Hisse evreni yüklenemedi. Lütfen internet bağlantınızı kontrol edin veya daha sonra tekrar deneyin.")
+                    st.stop()
+
+                result_df, fetch_errors = run_scan_yfinance(
+                    universe_df, max_scan, use_random, price_min, price_max, min_volume,
+                    vol_spike_mult, period, interval, rsi_filter, macd_filter, sma_filter, sector_filter,
+                )
+                st.session_state.active_source = "yfinance"
+                if fetch_errors:
+                    st.warning(f"Bazı veri parçaları alınırken sorun oluştu ({len(fetch_errors)} hata). Sonuçlar kısmi olabilir.")
+
             st.session_state.scan_results = result_df
-            st.session_state.price_data = price_data
             st.session_state.last_scan_time = datetime.now()
 
-            if fetch_errors:
-                st.warning(f"Bazı veri parçaları alınırken sorun oluştu ({len(fetch_errors)} hata). Sonuçlar kısmi olabilir.")
-
     result_df = st.session_state.scan_results
-    price_data = st.session_state.price_data
 
     if st.session_state.last_scan_time:
-        st.caption(f"Son Güncelleme: {st.session_state.last_scan_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.caption(
+            f"Son Güncelleme: {st.session_state.last_scan_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"— Kaynak: {st.session_state.active_source}"
+        )
 
     if result_df is None or result_df.empty:
         st.warning("Belirtilen kriterlere uyan hisse bulunamadı. Lütfen filtre parametrelerini gevşetin veya taranacak hisse sayısını artırın.")
@@ -534,8 +708,9 @@ def main():
                 st.caption(f"Hacim Artışı: {row['HacimArtış(x)']:.2f}x")
 
     st.subheader("📊 Filtrelenmiş Hisse Listesi")
+    display_columns = [c for c in result_df.columns if c != "Exchange"]
     st.dataframe(
-        result_df.sort_values("HacimArtış(x)", ascending=False),
+        result_df[display_columns].sort_values("HacimArtış(x)", ascending=False),
         use_container_width=True,
         hide_index=True,
     )
@@ -545,9 +720,15 @@ def main():
     selected_symbol = st.selectbox("Analiz için hisse seçin", symbol_list)
 
     if selected_symbol:
-        df_sel = price_data.get(selected_symbol)
+        with st.spinner(f"{selected_symbol} için geçmiş fiyat verisi indiriliyor..."):
+            chart_data, chart_errors = fetch_price_data((selected_symbol,), period=period, interval=interval)
+            df_sel = chart_data.get(selected_symbol)
+
         if df_sel is None or df_sel.empty:
-            st.error(f"{selected_symbol} için grafik verisi bulunamadı.")
+            st.error(
+                f"{selected_symbol} için grafik verisi bulunamadı. "
+                f"Bu sembolün yfinance üzerinde geçici olarak erişilemez durumda olması mümkündür."
+            )
         else:
             try:
                 df_ind = add_indicators(df_sel)
