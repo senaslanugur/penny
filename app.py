@@ -1,7 +1,4 @@
 
-## app.py
-
-```python
 import math
 import random
 from datetime import datetime
